@@ -9963,7 +9963,13 @@ static int routed_moe_launch(
         }
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
+#ifdef __HIP_PLATFORM_AMD__
+        const uint32_t use_expert_tiles = use_sorted_pairs &&
+            getenv("DS4_CUDA_MOE_EXPERT_TILES") != NULL &&
+            getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
+#else
         const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
+#endif
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
         const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
