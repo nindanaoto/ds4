@@ -22,15 +22,20 @@ else
 
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 
-ifeq ($(GPU_BACKEND),rocm)
-ROCM_PATH ?= /opt/rocm
-GPU_CC = $(ROCM_PATH)/bin/hipcc
 ROCM_ARCH ?= gfx1151
 
-GPU_CFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
+ifeq ($(GPU_BACKEND),rocm)
+ROCM_PATH ?= $(shell hipconfig --path 2>/dev/null)
+ifeq ($(strip $(ROCM_PATH)),)
+ROCM_PATH := /opt/rocm
+endif
+GPU_CC ?= $(ROCM_PATH)/bin/hipcc
+ifeq ($(wildcard $(GPU_CC)),)
+GPU_CC := hipcc
+endif
 
-@echo "ROCM_ARCH: $(ROCM_ARCH)"
+GPU_CFLAGS ?= -O3 -ffast-math -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
 
 EXTRA_DEPS = ds4_rocm.h
 
@@ -52,7 +57,6 @@ GPU_LDLIBS = $(CUDA_LDLIBS)
 endif
 
 CORE_OBJS = ds4.o ds4_cuda.o
-EXTRA_DEPS =
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 

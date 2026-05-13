@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
+#include <hip/amd_detail/amd_math_functions.h>
 #include <rocwmma/rocwmma-version.hpp>
 
 #define cudaError_t hipError_t
@@ -105,11 +106,8 @@ static __device__ __forceinline__ int32_t __vsub4(int32_t a, int32_t b) {
 
 // __dp4a: dot product of 4 signed int8s packed in an int32
 static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c) {
-    const int8_t *a_bytes = reinterpret_cast<const int8_t*>(&a);
-    const int8_t *b_bytes = reinterpret_cast<const int8_t*>(&b);
-    return c + (int32_t)a_bytes[0] * b_bytes[0]
-             + (int32_t)a_bytes[1] * b_bytes[1]
-             + (int32_t)a_bytes[2] * b_bytes[2]
-             + (int32_t)a_bytes[3] * b_bytes[3];
+    union { int32_t i; char4 v; } av, bv;
+    av.i = a;
+    bv.i = b;
+    return amd_mixed_dot(av.v, bv.v, c, false);
 }
-
