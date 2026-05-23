@@ -4,6 +4,7 @@
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hip/amd_detail/amd_math_functions.h>
+#include <hipcub/block/block_radix_sort.hpp>
 #include <rocwmma/rocwmma-version.hpp>
 
 #define cudaError_t hipError_t
@@ -24,6 +25,7 @@
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaDevAttrPageableMemoryAccess hipDeviceAttributePageableMemoryAccess
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
 #define cudaMemLocationTypeDevice hipMemLocationTypeDevice
 
 #define cudaMalloc hipMalloc
@@ -64,6 +66,9 @@
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventDisableTiming hipEventDisableTiming
 
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncSetAttribute(func, attr, value) hipFuncSetAttribute(reinterpret_cast<const void *>(func), attr, value)
+
 #define cublasHandle_t hipblasHandle_t
 #define cublasStatus_t hipblasStatus_t
 #define cublasMath_t hipblasMath_t
@@ -85,6 +90,8 @@
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasGemmEx hipblasGemmEx
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
+
+namespace cub = hipcub;
 
 static __device__ __forceinline__ int32_t __vcmpne4(uint32_t a, uint32_t b) {
     // For each byte: 0xFF if a != b, 0x00 if a == b

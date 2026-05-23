@@ -514,6 +514,15 @@ static int cuda_q8_use_dp4a(void) {
     return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
 }
 
+static int cuda_use_ordered_f16_matmul(void) {
+    if (getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    return getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
+#else
+    return 1;
+#endif
+}
+
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
         getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
@@ -6117,7 +6126,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        cuda_use_ordered_f16_matmul();
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
@@ -6178,7 +6187,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        !cuda_use_ordered_f16_matmul()) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
@@ -9964,16 +9973,27 @@ static int routed_moe_launch(
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
 #ifdef __HIP_PLATFORM_AMD__
+        const uint32_t use_rocm_v2 = getenv("DS4_CUDA_MOE_NO_ROCM_V2") == NULL;
         const uint32_t use_expert_tiles = use_sorted_pairs &&
-            getenv("DS4_CUDA_MOE_EXPERT_TILES") != NULL &&
+            (use_rocm_v2 || getenv("DS4_CUDA_MOE_EXPERT_TILES") != NULL) &&
             getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
 #else
+        const uint32_t use_rocm_v2 = 0;
         const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
 #endif
-        const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
-        const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
+        const uint32_t expert_tile_m =
+            ((use_rocm_v2 && getenv("DS4_CUDA_MOE_TILE8") == NULL) ||
+             getenv("DS4_CUDA_MOE_TILE4") != NULL) ? 4u : 8u;
+        const uint32_t write_gate_up =
+            getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL ||
+            getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL;
         const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
-        const uint32_t use_atomic_down = use_expert_tiles &&
+        const uint32_t use_gate_tiles_only =
+            use_expert_tiles &&
+            (getenv("DS4_CUDA_MOE_GATE_TILES_ONLY") != NULL ||
+             (use_rocm_v2 && getenv("DS4_CUDA_MOE_FULL_TILES") == NULL));
+        const uint32_t use_tiled_down = use_expert_tiles && !use_gate_tiles_only;
+        const uint32_t use_atomic_down = use_tiled_down &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
@@ -10292,7 +10312,7 @@ static int routed_moe_launch(
             }
             if (use_direct_down_sum6) {
                 /* The direct decode kernel writes the final token row. */
-            } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
+            } else if (sorted_pairs && use_tiled_down && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
                 if (use_down_row2048) {
                     if (down_row_span == 512u) {
