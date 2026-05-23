@@ -1977,6 +1977,24 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+__global__ static void matmul_q8_0_preq_1024_warp8_dp4a_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wb = w + row * (32u * 34u) + (uint64_t)lane * 34u;
+    const __half *scale_h = (const __half *)wb;
+    const int8_t *qs = (const int8_t *)(wb + 2u);
+    const int8_t *xqb = xq + lane * 32u;
+    float acc = __half2float(*scale_h) * xscale[lane] * (float)dot_i8x32_dp4a(qs, xqb);
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
         float *out1,
@@ -5933,6 +5951,24 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
+#ifdef __HIP_PLATFORM_AMD__
+        const int use_qb_spec1024 =
+            use_dp4a && in_dim == 1024u && out_dim == 32768u && blocks == 32u &&
+            getenv("DS4_CUDA_NO_Q8_QB_SPEC1024") == NULL;
+#else
+        const int use_qb_spec1024 =
+            use_dp4a && in_dim == 1024u && out_dim == 32768u && blocks == 32u &&
+            getenv("DS4_CUDA_Q8_QB_SPEC1024") != NULL;
+#endif
+        if (use_qb_spec1024) {
+            matmul_q8_0_preq_1024_warp8_dp4a_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq,
+                    xscale,
+                    out_dim);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 q_b spec1024 launch");
+        }
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
@@ -8484,6 +8520,71 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     }
 }
 
+__global__ static void moe_gate_up_mid_decode_lut_hwarp16_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 15u;
+    uint32_t row_lane = threadIdx.x >> 4u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    #pragma unroll
+    for (uint32_t rr = 0; rr < 8u; rr++) {
+        uint32_t row = blockIdx.x * 128u + row_lane + rr * 16u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        gate = half_warp_sum_f32(gate, lane);
+        up = half_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
 __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
@@ -10009,6 +10110,15 @@ static int routed_moe_launch(
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
+#ifdef __HIP_PLATFORM_AMD__
+        const uint32_t use_decode_h16_gate =
+            use_decode_lut_gate &&
+            getenv("DS4_CUDA_MOE_NO_DECODE_GATE_H16") == NULL;
+#else
+        const uint32_t use_decode_h16_gate =
+            use_decode_lut_gate &&
+            getenv("DS4_CUDA_MOE_DECODE_GATE_H16") != NULL;
+#endif
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW512") != NULL ? 512u :
             getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u : 1024u;
@@ -10227,22 +10337,41 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w,
-                        xq,
-                        (const int32_t *)selected->ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        write_gate_up,
-                        clamp);
+                    if (use_decode_h16_gate) {
+                        moe_gate_up_mid_decode_lut_hwarp16_kernel<<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            clamp);
+                    } else {
+                        moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            clamp);
+                    }
                 } else {
                     moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
