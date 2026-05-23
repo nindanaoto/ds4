@@ -2090,6 +2090,44 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
     }
 }
 
+__global__ static void matmul_q8_0_hc_expand_8192x4096_preq_warp8_dp4a_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *residual_hc,
+        const float *split,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale) {
+    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= 4096u) return;
+    const unsigned char *wr = w + (uint64_t)row * (256u * 34u);
+    float acc = 0.0f;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8u; k++) {
+        const uint32_t b = lane + k * 32u;
+        const unsigned char *wb = wr + (uint64_t)b * 34u;
+        const __half *scale_h = (const __half *)wb;
+        const int8_t *qs = (const int8_t *)(wb + 2u);
+        acc += __half2float(*scale_h) * xscale[b] * (float)dot_i8x32_dp4a(qs, xq + b * 32u);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        block_out[row] = acc;
+        const float *post = split + 4u;
+        const float *comb = split + 8u;
+        #pragma unroll
+        for (uint32_t dst_hc = 0; dst_hc < 4u; dst_hc++) {
+            float hc_acc = acc * post[dst_hc];
+            #pragma unroll
+            for (uint32_t src_hc = 0; src_hc < 4u; src_hc++) {
+                hc_acc += comb[dst_hc + src_hc * 4u] * residual_hc[src_hc * 4096u + row];
+            }
+            out_hc[dst_hc * 4096u + row] = hc_acc;
+        }
+    }
+}
+
 __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         float *out,
         const unsigned char *w,
@@ -2196,6 +2234,33 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) low[tok * low_dim + row] = acc;
+}
+
+__global__ static void grouped_q8_0_a_4096x1024x8_preq_warp8_dp4a_kernel(
+        float *low,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale) {
+    const uint32_t row_in_group = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t group = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row_in_group >= 1024u || group >= 8u) return;
+
+    const uint32_t row = group * 1024u + row_in_group;
+    const unsigned char *wr = w + (uint64_t)row * (128u * 34u);
+    const int8_t *xqr = xq + (uint64_t)group * 128u * 32u;
+    const float *xsr = xscale + (uint64_t)group * 128u;
+    float acc = 0.0f;
+    #pragma unroll
+    for (uint32_t k = 0; k < 4u; k++) {
+        const uint32_t b = lane + k * 32u;
+        const unsigned char *wb = wr + (uint64_t)b * 34u;
+        const __half *scale_h = (const __half *)wb;
+        const int8_t *qs = (const int8_t *)(wb + 2u);
+        acc += __half2float(*scale_h) * xsr[b] * (float)dot_i8x32_dp4a(qs, xqr + b * 32u);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) low[row] = acc;
 }
 
 __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
@@ -6121,25 +6186,88 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
+    const uint32_t profile =
+        getenv("DS4_CUDA_ATTN_OUTPUT_PROFILE") != NULL &&
+        label != NULL &&
+        strcmp(label, "q8_hc_expand") == 0;
+    cudaEvent_t prof_ev[3] = {NULL, NULL, NULL};
+    if (profile) {
+        for (uint32_t i = 0; i < 3u; i++) {
+            if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
+                for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
+                memset(prof_ev, 0, sizeof(prof_ev));
+                break;
+            }
+        }
+        if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
+    }
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
-            (float *)out_hc->ptr,
-            (float *)block_out->ptr,
-            block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
-            (const float *)residual_hc->ptr,
-            (const float *)split->ptr,
-            reinterpret_cast<const unsigned char *>(wptr),
-            xq,
-            xscale,
-            in_dim,
-            out_dim,
-            n_embd,
-            n_hc,
-            blocks,
-            block_add ? 1 : 0,
-            use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) {
+        for (uint32_t i = 0; i < 3u; i++) if (prof_ev[i]) (void)cudaEventDestroy(prof_ev[i]);
+        return 0;
+    }
+    if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
+#ifdef __HIP_PLATFORM_AMD__
+    const int use_attn_out_b_spec =
+        use_dp4a && !block_add && label != NULL && strcmp(label, "q8_hc_expand") == 0 &&
+        in_dim == 8192u && out_dim == 4096u && blocks == 256u &&
+        n_embd == 4096u && n_hc == 4u &&
+        getenv("DS4_CUDA_NO_ATTN_OUT_B_SPEC") == NULL;
+#else
+    const int use_attn_out_b_spec =
+        use_dp4a && !block_add && label != NULL && strcmp(label, "q8_hc_expand") == 0 &&
+        in_dim == 8192u && out_dim == 4096u && blocks == 256u &&
+        n_embd == 4096u && n_hc == 4u &&
+        getenv("DS4_CUDA_ATTN_OUT_B_SPEC") != NULL;
+#endif
+    if (use_attn_out_b_spec) {
+        matmul_q8_0_hc_expand_8192x4096_preq_warp8_dp4a_kernel<<<512, 256>>>(
+                (float *)out_hc->ptr,
+                (float *)block_out->ptr,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale);
+    } else {
+        matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out_hc->ptr,
+                (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                n_embd,
+                n_hc,
+                blocks,
+                block_add ? 1 : 0,
+                use_dp4a);
+    }
+    const int ok = cuda_ok(cudaGetLastError(), use_attn_out_b_spec ? "matmul_q8_0_hc_expand attn out b spec launch" : "matmul_q8_0_hc_expand launch");
+    if (prof_ev[2]) {
+        if (ok) {
+            (void)cudaEventRecord(prof_ev[2], 0);
+            if (cudaEventSynchronize(prof_ev[2]) == cudaSuccess) {
+                float ms_quant = 0.0f, ms_matvec_hc = 0.0f, ms_total = 0.0f;
+                (void)cudaEventElapsedTime(&ms_quant, prof_ev[0], prof_ev[1]);
+                (void)cudaEventElapsedTime(&ms_matvec_hc, prof_ev[1], prof_ev[2]);
+                (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[2]);
+                fprintf(stderr,
+                        "ds4: CUDA attn output profile part=b in_dim=%llu out_dim=%llu quant=%.3f matvec_hc=%.3f total=%.3f ms\n",
+                        (unsigned long long)in_dim,
+                        (unsigned long long)out_dim,
+                        ms_quant,
+                        ms_matvec_hc,
+                        ms_total);
+            }
+        }
+        for (uint32_t i = 0; i < 3u; i++) (void)cudaEventDestroy(prof_ev[i]);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -7606,25 +7734,79 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
+    const uint32_t profile = getenv("DS4_CUDA_ATTN_OUTPUT_PROFILE") != NULL;
+    cudaEvent_t prof_ev[3] = {NULL, NULL, NULL};
+    if (profile) {
+        for (uint32_t i = 0; i < 3u; i++) {
+            if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
+                for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
+                memset(prof_ev, 0, sizeof(prof_ev));
+                break;
+            }
+        }
+        if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
+    }
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
                                             xscale,
                                             (const float *)heads->ptr,
                                             group_dim,
                                             blocks_a);
-    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
-    dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
-    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
-                                                      out_a,
-                                                      xq,
-                                                      xscale,
-                                                      group_dim,
-                                                      rank,
-                                                      n_groups,
-                                                      1,
-                                                      blocks_a,
-                                                      use_dp4a);
-    return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
+    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) {
+        for (uint32_t i = 0; i < 3u; i++) if (prof_ev[i]) (void)cudaEventDestroy(prof_ev[i]);
+        return 0;
+    }
+    if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
+#ifdef __HIP_PLATFORM_AMD__
+    const int use_attn_out_a_spec =
+        use_dp4a && group_dim == 4096u && rank == 1024u && n_groups == 8u && blocks_a == 128u &&
+        getenv("DS4_CUDA_NO_ATTN_OUT_A_SPEC") == NULL;
+#else
+    const int use_attn_out_a_spec =
+        use_dp4a && group_dim == 4096u && rank == 1024u && n_groups == 8u && blocks_a == 128u &&
+        getenv("DS4_CUDA_ATTN_OUT_A_SPEC") != NULL;
+#endif
+    if (use_attn_out_a_spec) {
+        dim3 grid_a(128u, 8u, 1u);
+        grouped_q8_0_a_4096x1024x8_preq_warp8_dp4a_kernel<<<grid_a, 256>>>((float *)low->ptr,
+                                                                           out_a,
+                                                                           xq,
+                                                                           xscale);
+    } else {
+        dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
+        grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+                                                          out_a,
+                                                          xq,
+                                                          xscale,
+                                                          group_dim,
+                                                          rank,
+                                                          n_groups,
+                                                          1,
+                                                          blocks_a,
+                                                          use_dp4a);
+    }
+    const int ok = cuda_ok(cudaGetLastError(), use_attn_out_a_spec ? "attention_output_low_q8 spec launch" : "attention_output_low_q8 launch");
+    if (prof_ev[2]) {
+        if (ok) {
+            (void)cudaEventRecord(prof_ev[2], 0);
+            if (cudaEventSynchronize(prof_ev[2]) == cudaSuccess) {
+                float ms_quant = 0.0f, ms_matvec = 0.0f, ms_total = 0.0f;
+                (void)cudaEventElapsedTime(&ms_quant, prof_ev[0], prof_ev[1]);
+                (void)cudaEventElapsedTime(&ms_matvec, prof_ev[1], prof_ev[2]);
+                (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[2]);
+                fprintf(stderr,
+                        "ds4: CUDA attn output profile part=a groups=%u group_dim=%llu rank=%llu quant=%.3f matvec=%.3f total=%.3f ms\n",
+                        n_groups,
+                        (unsigned long long)group_dim,
+                        (unsigned long long)rank,
+                        ms_quant,
+                        ms_matvec,
+                        ms_total);
+            }
+        }
+        for (uint32_t i = 0; i < 3u; i++) (void)cudaEventDestroy(prof_ev[i]);
+    }
+    return ok;
 }
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
